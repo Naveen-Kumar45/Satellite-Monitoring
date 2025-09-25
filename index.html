@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Satellite Health & Debris Monitoring (JS Simulation)</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        /* Basic CSS for the layout, mimicking Dash's structure */
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f4f4f4;
+        }
+        #app-container {
+            width: 95%;
+            margin: auto;
+            max-width: 1400px;
+            background-color: white;
+            padding: 20px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h1, h3 {
+            text-align: center;
+            color: #333;
+        }
+        .graph-container {
+            margin-bottom: 20px;
+            border: 1px solid #ddd;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        /* Debris Table Styling */
+        #debris-table-container {
+            overflow-x: auto;
+            margin-bottom: 20px;
+        }
+        #debris-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        #debris-table th, #debris-table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        #debris-table th {
+            background-color: #f2f2f2;
+            color: #333;
+        }
+        /* Threshold Display */
+        #threshold-display {
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+            color: #555;
+            padding: 5px;
+            border: 1px dashed #ccc;
+            background-color: #f9f9f9;
+        }
+        /* Alert Modal Styling */
+        #alert-modal {
+            display: none; /* Controlled by JS */
+            position: fixed;
+            z-index: 9999;
+            left: 0;
+            top: 0;
+            width: 100vw;
+            height: 100vh;
+            background-color: rgba(0,0,0,0.2);
+            justify-content: center;
+            align-items: flex-start;
+        }
+        #alert-modal-content {
+            background-color: white;
+            padding: 24px 40px;
+            border-radius: 0 0 10px 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            text-align: center;
+            font-size: 22px;
+            color: red;
+            min-width: 350px;
+            max-width: 600px;
+            position: relative;
+            margin-top: 0;
+        }
+        #close-modal-btn {
+            position: absolute;
+            right: 18px;
+            top: 10px;
+            font-size: 28px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+
+<div id="app-container">
+    <h1>Satellite Health & Debris Monitoring (real-time minutes)</h1>
+    <div id="threshold-display"></div>
+    
+    <div class="graph-container"><div id="battery-graph"></div></div>
+    <div class="graph-container"><div id="temperature-graph"></div></div>
+    <div class="graph-container"><div id="attitude-graph"></div></div>
+
+    <h3>Debris Events</h3>
+    <div id="debris-table-container">
+        <table id="debris-table">
+            <thead>
+                <tr>
+                    <th>event_time</th>
+                    <th>object_id</th>
+                    <th>lat</th>
+                    <th>lon</th>
+                    <th>distance_km</th>
+                    <th>collision_chance_pct</th>
+                    <th>avoidance_maneuver</th>
+                </tr>
+            </thead>
+            <tbody id="debris-table-body">
+                </tbody>
+        </table>
+    </div>
+
+    <h3>3D Earth + Orbit</h3>
+    <div class="graph-container"><div id="debris-3d-graph"></div></div>
+
+    <div id="alert-modal">
+        <div id="alert-modal-content">
+            <button id="close-modal-btn">×</button>
+            <div id="alert-modal-message"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // -------------------------
+    // Configuration (real-time)
+    // -------------------------
+    const TICK_MS = 6000; // Reduced to 6 seconds for faster simulation, was 60,000 ms (1 minute)
+    const LOOP_MINUTES = 6;
+    const MIN_BATTERY = 1;
+    const MIN_TEMPERATURE = 2;
+    const MIN_DEBRIS = 4;
+    const MIN_ATTITUDE = 5;
+    const GAP_MINUTE = 6;
+
+    const THRESHOLDS = {
+        battery_voltage: [24, 30],
+        temperature: [0, 50],
+        attitude_error: [0, 0.1]
+    };
+    const ANOMALY_TARGETS = {
+        battery_voltage: 22.0,
+        temperature: 55.0,
+        attitude_error: 0.12
+    };
+    const RAMP_STEPS = {
+        battery_voltage: 0.5,
+        temperature: 1.5,
+        attitude_error: 0.01
+    };
+
+    // -------------------------
+    // App state (replacing Python globals and DataFrames)
+    // -------------------------
+    let telemetry_df = []; // [{timestamp, battery_voltage, temperature, attitude_error}, ...]
+    let debris_df = [];    // [{event_time, object_id, lat, lon, distance_km, ...}, ...]
+    let current = {
+        battery_voltage: 27.0,
+        temperature: 20.0,
+        attitude_error: 0.02
+    };
+
+    let battery_markers = [];
+    let temp_markers = [];
+    let attitude_markers = [];
+    let triggered_this_loop = new Set();
+    let orbit_phase = 0;
+    const START_TIME = Date.now();
+    let n_intervals = 0;
+    let isModalOpen = false; // To track if the modal is currently showing
+
+    // -------------------------
+    // Helpers
+    // -------------------------
+
+    // Simple beep sound (browser API)
+    function playBeep() {
+        // This is a much simpler replacement for winsound.Beep
+        try {
+            const context = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = context.createOscillator();
+            const gainNode = context.createGain();
+
+            oscillator.connect(gainNode);
+            gainNode.connect(context.destination);
+
+            oscillator.type = 'sine';
+            oscillator.frequency.setValueAtTime(3000, context.currentTime); // 3000 Hz
+            
+            // Set gain to start at 0.5 and fade out (simulating duration)
+            gainNode.gain.setValueAtTime(0.5, context.currentTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.6); // 600ms duration
+
+            oscillator.start();
+            oscillator.stop(context.currentTime + 0.6);
+
+        } catch (e) {
+            console.warn("AudioContext not supported or failed to start: ", e);
+        }
+    }
+
+    // Convert degrees to Earth Centered Earth Fixed (ECEF) coordinates
+    function latLonToEcef(lat, lon, r) {
+        const lat_r = lat * Math.PI / 180;
+        const lon_r = lon * Math.PI / 180;
+        const x = r * Math.cos(lat_r) * Math.cos(lon_r);
+        const y = r * Math.cos(lat_r) * Math.sin(lon_r);
+        const z = r * Math.sin(lat_r);
+        return [x, y, z];
+    }
+
+    // -------------------------
+    // 3D Earth + orbit
+    // -------------------------
+    function create_earth_orbit_figure(debris_points, orbit_phase_local) {
+        const EARTH_RADIUS = 6371; // km
+        const ORBIT_ALTITUDE = 400; // km
+        const orbit_r = EARTH_RADIUS + ORBIT_ALTITUDE;
+
+        // Earth surface sphere (simple geometry)
+        const u = Array.from({length: 60}, (_, i) => i * 2 * Math.PI / 59);
+        const v = Array.from({length: 30}, (_, i) => i * Math.PI / 29);
+        
+        const x = [];
+        const y = [];
+        const z = [];
+        
+        for (let i = 0; i < u.length; i++) {
+            const rowX = [];
+            const rowY = [];
+            const rowZ = [];
+            for (let j = 0; j < v.length; j++) {
+                rowX.push(Math.cos(u[i]) * Math.sin(v[j]) * EARTH_RADIUS);
+                rowY.push(Math.sin(u[i]) * Math.sin(v[j]) * EARTH_RADIUS);
+                rowZ.push(Math.cos(v[j]) * EARTH_RADIUS);
+            }
+            x.push(rowX);
+            y.push(rowY);
+            z.push(rowZ);
+        }
+
+        // Satellite orbit (circular equatorial)
+        const ORBIT_POINTS = 200;
+        const theta_base = Array.from({length: ORBIT_POINTS}, (_, i) => i * 2 * Math.PI / (ORBIT_POINTS - 1));
+        const theta = theta_base.map(t => t + (orbit_phase_local * 0.03)); // Animate by phase
+
+        const x_orbit = theta.map(t => orbit_r * Math.cos(t));
+        const y_orbit = theta.map(t => orbit_r * Math.sin(t));
+        const z_orbit = theta.map(() => 0); // Equatorial orbit
+
+        // Debris coords
+        const debris_x = [], debris_y = [], debris_z = [];
+        for (const [lat, lon] of debris_points) {
+            const [dx, dy, dz] = latLonToEcef(lat, lon, orbit_r);
+            debris_x.push(dx);
+            debris_y.push(dy);
+            debris_z.push(dz);
+        }
+
+        // Current satellite position marker
+        const idx = orbit_phase_local % ORBIT_POINTS;
+        const sat_pos = {
+            x: [x_orbit[idx]],
+            y: [y_orbit[idx]],
+            z: [z_orbit[idx]],
+            mode: 'markers',
+            marker: {size: 5, color: 'yellow'},
+            name: 'Satellite'
+        };
+
+        const data = [
+            { // Earth Surface
+                x: x, y: y, z: z,
+                type: 'surface',
+                colorscale: 'Blues',
+                opacity: 0.7,
+                showscale: false
+            },
+            { // Orbit Path
+                x: x_orbit, y: y_orbit, z: z_orbit,
+                mode: 'lines',
+                line: {color: 'red', width: 2},
+                name: 'Orbit',
+                type: 'scatter3d'
+            },
+            sat_pos // Satellite Marker
+        ];
+
+        if (debris_x.length > 0) {
+            data.push({ // Debris Markers
+                x: debris_x, y: debris_y, z: debris_z,
+                mode: 'markers',
+                marker: {size: 4, color: 'black'},
+                name: 'Debris',
+                type: 'scatter3d'
+            });
+        }
+
+        const layout = {
+            scene: {
+                xaxis: {showbackground: false, visible: false},
+                yaxis: {showbackground: false, visible: false},
+                zaxis: {showbackground: false, visible: false},
+                aspectmode: 'cube'
+            },
+            margin: {l: 0, r: 0, b: 0, t: 0},
+            showlegend: true
+        };
+
+        return {data: data, layout: layout};
+    }
+
+    // -------------------------
+    // Plotting Functions
+    // -------------------------
+
+    function plotTelemetry(id, history, y_key, title, unit, markers) {
+        const x_data = history.map(d => d.timestamp);
+        const y_data = history.map(d => d[y_key]);
+
+        const data = [
+            {
+                x: x_data,
+                y: y_data,
+                mode: 'lines',
+                name: 'Telemetry'
+            }
+        ];
+        
+        // Add anomaly markers
+        if (markers.length > 0) {
+            const marker_x = markers.map(m => m.time);
+            const marker_y = markers.map(m => m.value);
+            data.push({
+                x: marker_x,
+                y: marker_y,
+                mode: 'markers',
+                marker: {color: 'red', size: 8},
+                name: title.replace('Graph', 'Anomaly'),
+                type: 'scatter'
+            });
+        }
+
+        const layout = {
+            title: title + ` (${unit})`,
+            xaxis: {title: 'Timestamp'},
+            yaxis: {title: unit},
+            margin: {l: 50, r: 50, b: 50, t: 50}
+        };
+
+        Plotly.newPlot(id, data, layout, {responsive: true});
+    }
+
+    function updateDebrisTable() {
+        const tableBody = document.getElementById('debris-table-body');
+        tableBody.innerHTML = ''; // Clear existing rows
+
+        for (const event of debris_df) {
+            const row = tableBody.insertRow();
+            for (const key of ["event_time", "object_id", "lat", "lon", "distance_km", "collision_chance_pct", "avoidance_maneuver"]) {
+                const cell = row.insertCell();
+                cell.textContent = event[key];
+                if (key === "avoidance_maneuver") {
+                    cell.textContent = event[key] ? "True" : "False";
+                }
+            }
+        }
+    }
+
+
+    // -------------------------
+    // Main Simulation Loop (replacing Dash Callback)
+    // -------------------------
+    function tick() {
+        n_intervals++;
+        const now = new Date();
+        const elapsed_minutes = Math.floor((Date.now() - START_TIME) / 60000) + 1;
+        // Use a faster loop minute calculation based on TICK_MS for simulation speed-up
+        const minute_in_loop = ((n_intervals - 1) % LOOP_MINUTES) + 1;
+        
+        let alerts = [];
+        let anomaly_triggered = false;
+
+        // --- Stage: Battery anomaly at minute 1 ---
+        if (minute_in_loop === MIN_BATTERY && (!triggered_this_loop.has("battery"))) {
+            current.battery_voltage = current.battery_voltage - (ANOMALY_TARGETS.battery_voltage - current.battery_voltage) * 0.5;
+            battery_markers.push({time: now, value: current.battery_voltage});
+            alerts.push(`Battery voltage has fallen (${current.battery_voltage.toFixed(2)} V). It may cause power failure.`);
+            playBeep();
+            triggered_this_loop.add("battery");
+            anomaly_triggered = true;
+        }
+
+        // --- Stage: Temperature anomaly at minute 2 ---
+        if (minute_in_loop === MIN_TEMPERATURE && (!triggered_this_loop.has("temperature"))) {
+            current.temperature = current.temperature + (ANOMALY_TARGETS.temperature - current.temperature) * 0.5;
+            temp_markers.push({time: now, value: current.temperature});
+            alerts.push(`Temperature has risen (${current.temperature.toFixed(2)} °C). It may cause overheating.`);
+            playBeep();
+            triggered_this_loop.add("temperature");
+            anomaly_triggered = true;
+        }
+
+        // --- Stage: Debris detection at minute 4 ---
+        if (minute_in_loop === MIN_DEBRIS) {
+            if (!anomaly_triggered && (!triggered_this_loop.has("debris"))) {
+                // create debris event
+                const dist = (Math.random() * 4.5 + 0.5).toFixed(2); // 0.5 to 5.0 km
+                const collision_chance = Math.min(99, Math.max(1, (5.0 - dist) * 20 + (Math.random() * 10 - 5))).toFixed(1); // heuristic % chance
+                const debris_event = {
+                    event_time: now.toLocaleTimeString('en-US', {hour12: false}),
+                    object_id: `OBJ-${Math.floor(Math.random() * 9000) + 1000}`,
+                    lat: (Math.random() * 180 - 90).toFixed(2),
+                    lon: (Math.random() * 360 - 180).toFixed(2),
+                    distance_km: parseFloat(dist),
+                    collision_chance_pct: parseFloat(collision_chance),
+                    avoidance_maneuver: Math.random() < 0.5
+                };
+                debris_df.push(debris_event);
+                alerts.push(`Debris detected at ${dist} km. Chance of collision: ${collision_chance} %`);
+                playBeep();
+                triggered_this_loop.add("debris");
+            }
+        }
+        
+        // --- Stage: Attitude anomaly at minute 5 ---
+        if (minute_in_loop === MIN_ATTITUDE && (!triggered_this_loop.has("attitude"))) {
+            current.attitude_error = current.attitude_error + (ANOMALY_TARGETS.attitude_error - current.attitude_error) * 0.5;
+            attitude_markers.push({time: now, value: current.attitude_error});
+            alerts.push(`Attitude error exceeded (${current.attitude_error.toFixed(4)}). It may cause misalignment.`);
+            playBeep();
+            triggered_this_loop.add("attitude");
+            anomaly_triggered = true;
+        }
+
+        // --- Reset triggered flags at gap minute (minute 6) ---
+        if (minute_in_loop === GAP_MINUTE) {
+            triggered_this_loop.clear();
+        }
+
+        // --- Telemetry normal drift or continued ramp towards target ---
+        
+        // Battery ramp/drift:
+        if (triggered_this_loop.has("battery")) {
+            const target = ANOMALY_TARGETS.battery_voltage;
+            const step = RAMP_STEPS.battery_voltage;
+            if (current.battery_voltage > target) {
+                current.battery_voltage = Math.max(target, current.battery_voltage - step);
+            }
+        } else {
+            current.battery_voltage += (Math.random() * 0.1) - 0.05; // -0.05 to 0.05
+        }
+        current.battery_voltage = parseFloat(current.battery_voltage.toFixed(4)); // Keep stable number format
+
+        // Temperature ramp/drift:
+        if (triggered_this_loop.has("temperature")) {
+            const target = ANOMALY_TARGETS.temperature;
+            const step = RAMP_STEPS.temperature;
+            if (current.temperature < target) {
+                current.temperature = Math.min(target, current.temperature + step);
+            }
+        } else {
+            current.temperature += (Math.random() * 0.2) - 0.1; // -0.1 to 0.1
+        }
+        current.temperature = parseFloat(current.temperature.toFixed(4));
+
+        // Attitude ramp/drift:
+        if (triggered_this_loop.has("attitude")) {
+            const target = ANOMALY_TARGETS.attitude_error;
+            const step = RAMP_STEPS.attitude_error;
+            if (current.attitude_error < target) {
+                current.attitude_error = Math.min(target, current.attitude_error + step);
+            }
+        } else {
+            current.attitude_error += (Math.random() * 0.001) - 0.0005; // -0.0005 to 0.0005
+        }
+        current.attitude_error = parseFloat(current.attitude_error.toFixed(6));
+
+        // Record telemetry point
+        telemetry_df.push({
+            timestamp: now,
+            battery_voltage: current.battery_voltage,
+            temperature: current.temperature,
+            attitude_error: current.attitude_error
+        });
+
+        // Ensure history doesn't grow infinitely (e.g., keep last 500 points)
+        if (telemetry_df.length > 500) {
+            telemetry_df.shift();
+        }
+
+        // --- Update UI ---
+        
+        // 1. Graphs
+        plotTelemetry('battery-graph', telemetry_df, 'battery_voltage', 'Battery Voltage', 'V', battery_markers);
+        plotTelemetry('temperature-graph', telemetry_df, 'temperature', 'Temperature', '°C', temp_markers);
+        plotTelemetry('attitude-graph', telemetry_df, 'attitude_error', 'Attitude Error', 'Error', attitude_markers);
+
+        // 2. Debris Table
+        updateDebrisTable();
+
+        // 3. 3D View
+        const debris_points = debris_df.map(d => [d.lat, d.lon]);
+        const fig_3d = create_earth_orbit_figure(debris_points, orbit_phase);
+        Plotly.newPlot('debris-3d-graph', fig_3d.data, fig_3d.layout, {responsive: true});
+
+        // 4. Threshold Display
+        const threshold_text = Object.keys(THRESHOLDS).map(key => 
+            `${key.replace('_', ' ')}: ${THRESHOLDS[key][0]} - ${THRESHOLDS[key][1]}`
+        ).join(' | ');
+        document.getElementById('threshold-display').textContent = threshold_text;
+
+        // 5. Alert Modal
+        if (alerts.length > 0 && !isModalOpen) {
+            const alert_message = alerts.join('   ');
+            document.getElementById('alert-modal-message').textContent = alert_message;
+            document.getElementById('alert-modal').style.display = 'flex';
+            isModalOpen = true;
+        } else if (alerts.length === 0 && isModalOpen) {
+             // Keep open until closed by user if it was triggered
+        } else if (alerts.length === 0 && !isModalOpen) {
+            document.getElementById('alert-modal').style.display = 'none';
+        }
+
+
+        // 6. Update orbit phase
+        orbit_phase = (orbit_phase + 1) % 3600;
+    }
+
+    // -------------------------
+    // Event Listeners and Initialization
+    // -------------------------
+    document.addEventListener('DOMContentLoaded', () => {
+        // Initial run to draw empty graphs and set up state
+        tick(); 
+        
+        // Start the simulation loop
+        setInterval(tick, TICK_MS);
+
+        // Modal close button
+        document.getElementById('close-modal-btn').addEventListener('click', () => {
+            document.getElementById('alert-modal').style.display = 'none';
+            isModalOpen = false;
+        });
+    });
+
+</script>
+
+</body>
+</html>
